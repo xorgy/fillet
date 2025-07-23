@@ -1,0 +1,180 @@
+env:
+  RUST_STABLE_VER: "1.88" # In quotes because otherwise (e.g.) 1.70 would be interpreted as 1.7
+  RUST_MIN_VER: "1.85"
+
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - master
+
+jobs:
+  fmt:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          components: rustfmt
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  clippy-stable:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          components: clippy
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo clippy
+        run: cargo clippy --locked -- -D warnings
+
+      - name: cargo clippy (auxiliary)
+        run: cargo clippy --locked --tests --benches -- -D warnings
+
+  test-stable:
+    name: cargo test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo test
+        run: cargo test --locked --no-fail-fast
+
+  test-stable-ubuntu-aarch64:
+    name: cargo test (Ubuntu 24.04 AArch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo test
+        run: cargo test --locked --no-fail-fast
+
+  test-stable-windows-aarch64:
+    name: cargo test (Windows 11 AArch64)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo test
+        run: cargo test --locked --no-fail-fast
+
+  check-msrv:
+    name: cargo check (msrv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install msrv toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MIN_VER }}
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo check
+        run: cargo check --locked
+
+  miri:
+    name: cargo miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo miri
+        run: cargo miri test --locked --no-fail-fast
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-track-alloc-accesses -Zmiri-recursive-validation"
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo doc
+        run: cargo doc --locked --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+  # If this fails, consider changing your text or adding something to .typos.toml.
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check typos
+        uses: crate-ci/typos@v1.33.1

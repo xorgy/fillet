@@ -1,0 +1,33 @@
+[package]
+name = "fillet"
+version = "0.1.0"
+edition = "2024"
+description = "An efficient thin pointer based contiguous collection."
+license = "ISC OR Apache-2.0 OR MIT"
+rust-version = "1.85"
+repository = "https://github.com/xorgy/fillet"
+categories = [
+    "data-structures",
+    "no-std"
+]
+keywords = [
+    "no_std",
+    "thin",
+    "vec",
+    "zst",
+]
+
+[[bench]]
+name = "fillet_bench"
+harness = false
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.7"
+rand = "0.9.2"
+shuffling-allocator = "1.1.2"
