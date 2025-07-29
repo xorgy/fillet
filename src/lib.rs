@@ -434,31 +434,7 @@ impl<T> Fillet<T> {
 
 impl<T> Drop for Fillet<T> {
     fn drop(&mut self) {
-        // ZSTs do not have an allocation.
-        if size_of::<T>() == 0 {
-            let len = self.len();
-            if len != 0 {
-                // SAFETY: drop_in_place is safe on a dangling pointer for ZSTs
-                unsafe {
-                    ptr::drop_in_place(slice::from_raw_parts_mut(ptr::dangling_mut::<T>(), len));
-                }
-            }
-            return;
-        }
-
-        let len = self.len();
-        if len != 0 {
-            unsafe {
-                let ptr = self.ptr.unwrap_unchecked().as_ptr();
-                // SAFETY: Layout was computable when the `Fillet` was created.
-                let layout = Fillet::<T>::compute_layout_unchecked(len);
-                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
-                    ptr.byte_add(Self::DATA_OFFSET).cast::<T>(),
-                    len,
-                ));
-                dealloc(ptr, layout);
-            }
-        }
+        self.clear();
     }
 }
 
@@ -752,9 +728,7 @@ impl<T> Extend<T> for Fillet<T> {
         // ZSTs do not have an allocation.
         if size_of::<T>() == 0 {
             let added = iter.map(ManuallyDrop::new).count();
-            unsafe {
-                self.len += added;
-            }
+            unsafe { self.len += added };
             return;
         }
 
@@ -1029,27 +1003,6 @@ mod tests {
     use core::iter::repeat_n;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Clone)]
-    struct Dropper;
-    static DROPS: AtomicUsize = AtomicUsize::new(0);
-    impl Drop for Dropper {
-        fn drop(&mut self) {
-            DROPS.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    struct CloneDropper(i32);
-    impl Clone for CloneDropper {
-        fn clone(&self) -> Self {
-            Self(self.0)
-        }
-    }
-    impl Drop for CloneDropper {
-        fn drop(&mut self) {
-            DROPS.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     /// Construct an empty `Fillet`.
     #[test]
     fn construction_empty() {
@@ -1301,9 +1254,17 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn drop_counts_basic() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let f: Fillet<Dropper> = (0..3).map(|_| Dropper).collect();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 3);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
@@ -1313,10 +1274,17 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn drop_counts_from_array() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let arr = [Dropper, Dropper];
         let f: Fillet<Dropper> = arr.into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
     }
@@ -1326,10 +1294,19 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn drop_counts_from_slice_clone() {
-        DROPS.store(0, Ordering::SeqCst);
-        let array = [CloneDropper(0), CloneDropper(1)];
-        let f: Fillet<CloneDropper> = array.as_ref().into();
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let array = [Dropper, Dropper];
+        let f: Fillet<Dropper> = array.as_ref().into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(array);
@@ -1341,10 +1318,17 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn drop_counts_from_box_no_double() {
-        DROPS.store(0, Ordering::SeqCst);
-        let boxed: Box<[Dropper]> = vec![Dropper, Dropper].into_boxed_slice();
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let boxed: Box<[Dropper]> = Box::from([Dropper, Dropper]);
         let f: Fillet<Dropper> = boxed.into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
     }
@@ -1354,10 +1338,17 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn drop_counts_from_option() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let o: Option<Dropper> = Some(Dropper);
         let f: Fillet<Dropper> = o.into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 1);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 1);
     }
@@ -1378,7 +1369,13 @@ mod tests {
     /// [`FilletIntoIter`] should cause dropping during iteration.
     #[test]
     fn into_iter_partial_drop() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let f: Fillet<Dropper> = [Dropper, Dropper, Dropper].into();
         let mut iter = f.into_iter();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
@@ -1495,9 +1492,16 @@ mod tests {
     /// [`truncate`]: Fillet::truncate
     #[test]
     fn truncate_drop() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = [Dropper, Dropper, Dropper].into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 3);
         f.truncate(1);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(f);
@@ -1522,9 +1526,16 @@ mod tests {
     /// [`clear`]: Fillet::clear
     #[test]
     fn clear_drop() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = [Dropper, Dropper].into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         f.clear();
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(f);
@@ -1626,13 +1637,21 @@ mod tests {
     /// [`extend_from_within`]: Fillet::extend_from_within
     #[test]
     fn extend_from_within_zst() {
-        DROPS.store(0, Ordering::SeqCst);
-        let mut f: Fillet<Dropper> = repeat_n(Dropper, 2).collect();
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut f: Fillet<Dropper> = [Dropper, Dropper].into();
         f.extend_from_within(0..1);
         assert_eq!(f.len(), 3);
         f.extend_from_within(..);
         assert_eq!(f.len(), 6);
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 6);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 6);
     }
@@ -1642,7 +1661,13 @@ mod tests {
     /// [`extend`]: Fillet::extend
     #[test]
     fn extend_drop() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = [Dropper].into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
         f.extend((0..2).map(|_| Dropper));
@@ -1695,10 +1720,19 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn from_slice_clone_drop() {
-        DROPS.store(0, Ordering::SeqCst);
-        let array = [CloneDropper(0), CloneDropper(1)];
-        let f: Fillet<CloneDropper> = Fillet::from(array.as_ref());
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let array = [Dropper, Dropper];
+        let f: Fillet<Dropper> = Fillet::from(array.as_ref());
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(array);
@@ -1710,9 +1744,16 @@ mod tests {
     /// [`drop`]: Fillet::drop
     #[test]
     fn from_iter_drop() {
-        DROPS.store(0, Ordering::SeqCst);
-        let f: Fillet<Dropper> = (0..3).map(|_| Dropper).collect();
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let f: Fillet<Dropper> = repeat_n((), 3).map(|_| Dropper).collect();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 3);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
@@ -1731,14 +1772,22 @@ mod tests {
         assert_eq!(*f, []);
         assert_eq!(f.pop(), None);
 
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = [Dropper, Dropper].into();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         let item = f.pop();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0); // Popped item not dropped yet
         assert_eq!(f.len(), 1);
         drop(item);
         assert_eq!(DROPS.load(Ordering::SeqCst), 1); // Popped item dropped
+        assert_eq!(f.len(), 1);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2); // Remaining item dropped
     }
@@ -1784,12 +1833,19 @@ mod tests {
     /// [`push`]: Fillet::push
     #[test]
     fn push_drop() {
-        DROPS.store(0, Ordering::SeqCst);
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = Fillet::EMPTY;
         f.push(Dropper);
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
         f.push(Dropper);
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 2);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
     }
@@ -1809,9 +1865,16 @@ mod tests {
     /// [`retain`]: Fillet::retain
     #[test]
     fn retain_drop_counts() {
-        DROPS.store(0, Ordering::SeqCst);
-        let mut f: Fillet<Dropper> = repeat_n(Dropper, 5).collect();
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut f: Fillet<Dropper> = repeat_n((), 5).map(|_| Dropper).collect();
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 5);
         f.retain(|_| false); // Drop all
         assert_eq!(f.len(), 0);
         assert_eq!(DROPS.load(Ordering::SeqCst), 5);
@@ -1842,8 +1905,14 @@ mod tests {
     /// [`retain`]: Fillet::retain
     #[test]
     fn retain_dropper_side_effect() {
-        DROPS.store(0, Ordering::SeqCst);
-        let mut f: Fillet<Dropper> = repeat_n(Dropper, 4).collect();
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut f: Fillet<Dropper> = [Dropper, Dropper, Dropper, Dropper].into();
         f.retain(|_| false);
         assert_eq!(f.len(), 0);
         assert_eq!(DROPS.load(Ordering::SeqCst), 4);
@@ -1861,7 +1930,7 @@ mod tests {
         // but [dst..old_len] contains uninitialized slots (after read/drop or read/write), leading to UB
         // (Miri detects: drop of uninitialized memory).
         // Use Dropper to force Drop glue on uninit slots.
-        let mut f: Fillet<Dropper> = repeat_n(Dropper, 5).collect();
+        let mut f: Fillet<()> = repeat_n((), 5).collect();
         let mut count = 0;
         f.retain(|_| {
             count += 1;
@@ -2037,10 +2106,19 @@ mod tests {
     /// ZST with drop during retain.
     #[test]
     fn zst_drop_retain() {
-        DROPS.store(0, Ordering::SeqCst);
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = repeat_n(Dropper, 10).collect();
         f.retain(|_| false); // Drop all via read/drop.
         assert_eq!(f.len(), 0);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 10);
+        drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 10);
 
         let mut f: Fillet<Dropper> = repeat_n(Dropper, 10).collect();
@@ -2084,11 +2162,19 @@ Requested Fillet larger than isize::MAX bytes.")]
     /// ZST with drop during extend_from_within.
     #[test]
     fn zst_drop_extend_from_within() {
-        DROPS.store(0, Ordering::SeqCst);
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let mut f: Fillet<Dropper> = repeat_n(Dropper, 5).collect();
         f.extend_from_within(1..4);
         assert_eq!(f.len(), 8);
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(f.len(), 8);
         drop(f);
         assert_eq!(DROPS.load(Ordering::SeqCst), 8);
     }
