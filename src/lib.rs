@@ -827,6 +827,42 @@ impl<T> Fillet<T> {
     }
 }
 
+impl<T> From<FilletIntoIter<T>> for Fillet<T> {
+    fn from(i: FilletIntoIter<T>) -> Self {
+        let i = ManuallyDrop::new(i);
+        let len = i.len();
+        // ZSTs do not have an allocation.
+        if size_of::<T>() == 0 {
+            return Fillet { len };
+        }
+
+        // SAFETY: `FilletIntoIter` has the same the same heap layout as `Fillet`.
+        unsafe {
+            match i.inner.ptr {
+                None => Fillet { ptr: None },
+                Some(data_ptr) => {
+                    let raw_ptr = data_ptr.cast::<u8>().byte_sub(Fillet::<T>::DATA_OFFSET);
+                    let orig_len = raw_ptr.cast::<usize>().read();
+
+                    let mut f = Fillet { ptr: Some(raw_ptr) };
+
+                    // If some elements have been dropped, then we need to shrink.
+                    if orig_len != len {
+                        // Do a move since remaining elements could overlap.
+                        ptr::copy(data_ptr.add(i.start).as_ptr(), data_ptr.as_ptr(), len);
+                        if let Some(nzl) = NonZeroUsize::new(len) {
+                            f.shrink_uninit_nonempty(nzl);
+                        } else {
+                            f.dealloc_nonempty();
+                        }
+                    }
+                    f
+                }
+            }
+        }
+    }
+}
+
 impl<T: Debug> Debug for Fillet<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(self.deref(), f)
@@ -853,6 +889,25 @@ pub struct FilletIntoIter<T> {
     start: usize,
     end: usize,
     _marker: PhantomData<T>,
+}
+
+impl<T> FilletIntoIter<T> {
+    /// Extract a slice over the remaining elements, or a dangling slice when empty.
+    pub fn as_slice(&self) -> &[T] {
+        // ZSTs do not have an allocation.
+        if size_of::<T>() == 0 {
+            return unsafe {
+                slice::from_raw_parts(ptr::dangling::<T>().add(self.start), self.len())
+            };
+        }
+
+        unsafe {
+            match self.inner.ptr {
+                None => slice::from_raw_parts(ptr::dangling::<T>(), 0),
+                Some(ptr) => slice::from_raw_parts(ptr.add(self.start).as_ptr(), self.len()),
+            }
+        }
+    }
 }
 
 impl<T> ExactSizeIterator for FilletIntoIter<T> {
@@ -944,10 +999,26 @@ impl<T> Drop for FilletIntoIter<T> {
     }
 }
 
+impl<T: Clone> FilletIntoIter<T> {
+    /// Clone the remaining elements into a new [`Fillet`].
+    #[inline]
+    fn as_fillet(&self) -> Fillet<T> {
+        self.as_slice().into()
+    }
+}
+
+impl<T: Clone> Clone for FilletIntoIter<T> {
+    #[inline]
+    fn clone(&self) -> FilletIntoIter<T> {
+        self.as_fillet().into_iter()
+    }
+}
+
 impl<T> IntoIterator for Fillet<T> {
     type Item = T;
     type IntoIter = FilletIntoIter<T>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         let f = ManuallyDrop::new(self);
 
@@ -992,6 +1063,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use core::iter::repeat_n;
+    use core::panic::AssertUnwindSafe;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     /// Construct an empty `Fillet`.
@@ -1955,7 +2027,7 @@ mod tests {
     #[test]
     fn as_ref_empty() {
         let f: Fillet<i32> = Fillet::EMPTY;
-        let slice: &[i32] = f.as_ref();
+        let slice = f.as_ref();
         assert_eq!(slice, &[]);
 
         // Generic usage
@@ -1992,7 +2064,7 @@ mod tests {
     #[test]
     fn as_mut_empty() {
         let mut f: Fillet<i32> = Fillet::EMPTY;
-        let slice: &[i32] = f.as_mut();
+        let slice = f.as_mut();
         assert_eq!(slice, &mut []);
 
         // Generic usage
@@ -2230,5 +2302,192 @@ Requested Fillet larger than isize::MAX bytes.")]
         if let Tagged::A { x } = f[0] {
             assert_eq!(x, 42);
         }
+    }
+
+    /// IntoIter clone.
+    #[test]
+    fn into_iter_clone() {
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        struct Dropper(i32);
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let fillet: Fillet<Fillet<Dropper>> = repeat_n(repeat_n(420i32, 5), 10)
+            .map(|i| i.map(Dropper).collect())
+            .collect();
+        let iter = fillet.into_iter();
+        let cloned = iter.clone();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        drop(cloned);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 50);
+        drop(iter);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 100);
+    }
+
+    /// [`Fillet`] to [`FilletIntoIter`] round trips.
+    #[test]
+    fn into_iter_round_trip() {
+        let fillet: Fillet<Fillet<i32>> = repeat_n(repeat_n(420i32, 5), 10)
+            .map(|i| i.collect())
+            .collect();
+        let orig_ptr = unsafe { fillet.ptr };
+        let iter = fillet.into_iter();
+        let cloned = iter.clone();
+        let clone_ptr = unsafe {
+            cloned
+                .inner
+                .ptr
+                .map(|nn| nn.byte_sub(Fillet::<Fillet<i32>>::DATA_OFFSET).cast::<u8>())
+        };
+        let mut gen2_clone = cloned.clone();
+        assert_eq!(cloned.len(), 10);
+        let clone_fillet = Fillet::from(cloned);
+        let clone_fillet_ptr = unsafe { clone_fillet.ptr };
+        // Cloned [`FilletIntoIter`] started life as a [`Fillet`], so it should
+        // have the same base heap pointer when converted back to one.
+        assert_eq!(clone_ptr, clone_fillet_ptr);
+        for _ in 0..5 {
+            drop(gen2_clone.next());
+        }
+        assert_eq!(gen2_clone.len(), 5);
+        let gen2_clone_fillet = Fillet::from(gen2_clone);
+        assert_eq!(gen2_clone_fillet.len(), 5);
+        drop(gen2_clone_fillet);
+        let fillet_again: Fillet<_> = iter.into();
+        let again_ptr = unsafe { fillet_again.ptr };
+        // If nothing has been dropped in the iterator, then the heap is untouched.
+        assert_eq!(orig_ptr, again_ptr);
+        // Sanity check.
+        assert_eq!(fillet_again.len(), 10);
+        assert_eq!(fillet_again[0][0], 420);
+        assert_eq!(*fillet_again, *clone_fillet);
+    }
+
+    /// [`FilletIntoIter`] leak on panic.
+    #[test]
+    #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+    fn into_iter_leak() {
+        extern crate std;
+        use std::panic::catch_unwind;
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let f: Fillet<Dropper> = [Dropper, Dropper, Dropper].into();
+        catch_unwind(AssertUnwindSafe(|| drop(f.into_iter()))).ok();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+    }
+
+    /// [`FilletIntoIter`] ZST has aligned dangling pointer for drop.
+    #[test]
+    fn into_iter_zst_aligned_drop() {
+        #[derive(Debug, Clone)]
+        struct AlignedZstWithDrop([u64; 0]);
+        impl Drop for AlignedZstWithDrop {
+            fn drop(&mut self) {
+                let addr = self as *mut _ as usize;
+                assert!(addr % align_of::<u64>() == 0);
+            }
+        }
+
+        const C: AlignedZstWithDrop = AlignedZstWithDrop([0u64; 0]);
+
+        for _ in [C].into_iter() {}
+        for _ in [C; 5].into_iter().rev() {}
+
+        let mut it = [C, C].into_iter();
+        assert!(it.next().is_some());
+        drop(it);
+
+        let mut it = [C, C].into_iter();
+        let _ = [0; 1].map(|_| it.next());
+        drop(it);
+
+        let mut it = [C, C].into_iter();
+        for _ in 0..4 {
+            it.next();
+        }
+        drop(it);
+    }
+
+    /// Overaligned allocations with push/extend/truncate.
+    #[test]
+    fn big_align_push_extend_truncate() {
+        #[repr(align(256))]
+        struct Foo(usize);
+        let mut f = Fillet::EMPTY;
+        f.push(Foo(273));
+        for i in 0..10 {
+            f.extend((0..i).map(|_| Foo(42)));
+            assert!(f[0].0 == 273);
+            assert!(f.as_ptr() as usize & 0xff == 0);
+            f.truncate(1);
+            assert!(f[0].0 == 273);
+            assert!(f.as_ptr() as usize & 0xff == 0);
+        }
+    }
+
+    /// swap via mut slice.
+    #[test]
+    fn mut_slice_swap() {
+        let mut f: Fillet<isize> = [0, 1, 2, 3, 4, 5, 6].into();
+        let slice = f.as_mut_slice();
+        slice.swap(2, 4);
+        assert_eq!(f[2], 4);
+        assert_eq!(f[4], 2);
+    }
+
+    /// Don't panic for out-of-range `get` nor for truncate longer than [`Fillet::MAX_LEN`].
+    #[test]
+    fn get_max_dont_panic() {
+        let mut f: Fillet<_> = [0].into();
+        let _ = f.get(usize::MAX);
+        f.truncate(usize::MAX);
+    }
+
+    /// Slice bounds set correctly, so panic when indexed incorrectly.
+    #[test]
+    #[should_panic]
+    fn slice_out_of_bounds_1() {
+        let f = Fillet::<()>::EMPTY;
+        let _ = &f[!0..];
+    }
+
+    /// Slice bounds set correctly, so panic when indexed incorrectly.
+    #[test]
+    #[should_panic]
+    fn slice_out_of_bounds_2() {
+        let f = Fillet::<()>::EMPTY;
+        let _ = &f[..6];
+    }
+
+    #[test]
+    #[should_panic]
+    fn slice_out_of_bounds_3() {
+        let f = Fillet::<()>::EMPTY;
+        #[allow(clippy::reversed_empty_ranges)]
+        let _ = &f[!0..4];
+    }
+
+    #[test]
+    #[should_panic]
+    fn slice_out_of_bounds_4() {
+        let f = Fillet::<()>::EMPTY;
+        let _ = &f[1..6];
+    }
+
+    #[test]
+    #[should_panic]
+    fn slice_out_of_bounds_5() {
+        let f = Fillet::<()>::EMPTY;
+        #[allow(clippy::reversed_empty_ranges)]
+        let _ = &f[3..2];
     }
 }
