@@ -76,7 +76,8 @@ use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
 use core::hint::unreachable_unchecked;
 use core::iter::{
-    self, DoubleEndedIterator, ExactSizeIterator, FromIterator, IntoIterator, Iterator,
+    self, DoubleEndedIterator, ExactSizeIterator, FromIterator, FusedIterator, IntoIterator,
+    Iterator,
 };
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit, align_of, size_of};
@@ -357,7 +358,7 @@ impl<T> Fillet<T> {
             self.len = new_len;
             // SAFETY: drop_in_place is safe on a dangling pointer for ZSTs
             unsafe {
-                ptr::drop_in_place(slice::from_raw_parts_mut(
+                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                     ptr::dangling_mut::<T>().add(new_len),
                     old_len - new_len,
                 ));
@@ -373,7 +374,7 @@ impl<T> Fillet<T> {
             let old_layout = Self::compute_layout_unchecked(old_len);
 
             // SAFETY: Caller responsible for ensuring `new_len < self.len()`.
-            ptr::drop_in_place(slice::from_raw_parts_mut(
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                 old_ptr.byte_add(Self::DATA_OFFSET).cast::<T>().add(new_len),
                 old_len - new_len,
             ));
@@ -540,6 +541,66 @@ impl<T: Eq> Eq for Fillet<T> {}
 impl<T: Hash> Hash for Fillet<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.deref().hash(state)
+    }
+}
+
+impl<T: PartialOrd> PartialOrd for Fillet<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
+    }
+}
+
+impl<T: Ord> Ord for Fillet<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl<T: PartialEq<U>, U> PartialEq<[U]> for Fillet<T> {
+    fn eq(&self, other: &[U]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl<T: PartialEq<U>, U> PartialEq<Fillet<U>> for [T] {
+    fn eq(&self, other: &Fillet<U>) -> bool {
+        self == other.as_slice()
+    }
+}
+
+impl<T: PartialEq<U>, U> PartialEq<&[U]> for Fillet<T> {
+    fn eq(&self, other: &&[U]) -> bool {
+        self.as_slice() == *other
+    }
+}
+
+impl<T: PartialEq<U>, U> PartialEq<Fillet<U>> for &[T] {
+    fn eq(&self, other: &Fillet<U>) -> bool {
+        *self == other.as_slice()
+    }
+}
+
+impl<T: PartialEq<U>, U, const N: usize> PartialEq<[U; N]> for Fillet<T> {
+    fn eq(&self, other: &[U; N]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: PartialEq<U>, U, const N: usize> PartialEq<Fillet<U>> for [T; N] {
+    fn eq(&self, other: &Fillet<U>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: PartialEq<U>, U, const N: usize> PartialEq<&[U; N]> for Fillet<T> {
+    fn eq(&self, other: &&[U; N]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: PartialEq<U>, U, const N: usize> PartialEq<Fillet<U>> for &[T; N] {
+    fn eq(&self, other: &Fillet<U>) -> bool {
+        self.as_slice() == other.as_slice()
     }
 }
 
@@ -769,6 +830,12 @@ impl<T> Extend<T> for Fillet<T> {
     }
 }
 
+impl<'a, T: Copy + 'a> Extend<&'a T> for Fillet<T> {
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
 impl<T> FromIterator<T> for Fillet<T> {
     #[inline(always)]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
@@ -855,6 +922,52 @@ pub struct FilletIntoIter<T> {
     _marker: PhantomData<T>,
 }
 
+impl<T> FilletIntoIter<T> {
+    /// View the unconsumed elements as a slice.
+    pub fn as_slice(&self) -> &[T] {
+        if size_of::<T>() == 0 {
+            return unsafe { slice::from_raw_parts(ptr::dangling::<T>(), self.end - self.start) };
+        }
+
+        unsafe {
+            match self.inner.ptr {
+                None => &[],
+                Some(ptr) => {
+                    slice::from_raw_parts(ptr.as_ptr().add(self.start), self.end - self.start)
+                }
+            }
+        }
+    }
+
+    /// View the unconsumed elements as a mutable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if size_of::<T>() == 0 {
+            return unsafe {
+                slice::from_raw_parts_mut(ptr::dangling_mut::<T>(), self.end - self.start)
+            };
+        }
+
+        unsafe {
+            match self.inner.ptr {
+                None => &mut [],
+                Some(ptr) => {
+                    slice::from_raw_parts_mut(ptr.as_ptr().add(self.start), self.end - self.start)
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: FilletIntoIter owns [T], so is Send/Sync as long as T is.
+unsafe impl<T: Send> Send for FilletIntoIter<T> {}
+unsafe impl<T: Sync> Sync for FilletIntoIter<T> {}
+
+impl<T: Debug> Debug for FilletIntoIter<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Debug::fmt(self.as_slice(), f)
+    }
+}
+
 impl<T> ExactSizeIterator for FilletIntoIter<T> {
     fn len(&self) -> usize {
         self.end - self.start
@@ -911,6 +1024,8 @@ impl<T> DoubleEndedIterator for FilletIntoIter<T> {
     }
 }
 
+impl<T> FusedIterator for FilletIntoIter<T> {}
+
 impl<T> Drop for FilletIntoIter<T> {
     fn drop(&mut self) {
         // ZSTs do not have an allocation.
@@ -919,7 +1034,7 @@ impl<T> Drop for FilletIntoIter<T> {
             if len != 0 {
                 // SAFETY: drop_in_place is safe on a dangling pointer for ZSTs
                 unsafe {
-                    ptr::drop_in_place(slice::from_raw_parts_mut(
+                    ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                         ptr::dangling_mut::<T>().add(self.start),
                         len,
                     ));
@@ -984,6 +1099,24 @@ impl<T> IntoIterator for Fillet<T> {
                 }
             }
         }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Fillet<T> {
+    type Item = &'a T;
+    type IntoIter = slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Fillet<T> {
+    type Item = &'a mut T;
+    type IntoIter = slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
     }
 }
 
@@ -1110,7 +1243,7 @@ mod tests {
     /// Construct from an empty iterator.
     #[test]
     fn construction_from_iterator_empty() {
-        let f: Fillet<i32> = core::iter::empty().collect();
+        let f: Fillet<i32> = iter::empty().collect();
         assert_eq!(f.len(), 0);
         assert_eq!(*f, []);
     }
@@ -1605,7 +1738,7 @@ mod tests {
     #[test]
     fn extend_empty() {
         let mut f: Fillet<i32> = [1].into();
-        f.extend(core::iter::empty::<i32>());
+        f.extend(iter::empty::<i32>());
         assert_eq!(*f, [1]);
     }
 
@@ -2230,5 +2363,158 @@ Requested Fillet larger than isize::MAX bytes.")]
         if let Tagged::A { x } = f[0] {
             assert_eq!(x, 42);
         }
+    }
+
+    /// `IntoIterator` for `&Fillet`.
+    #[test]
+    fn into_iter_ref() {
+        let f: Fillet<i32> = [1, 2, 3].into();
+        let mut sum = 0;
+        for &x in &f {
+            sum += x;
+        }
+        assert_eq!(sum, 6);
+        assert_eq!(f.len(), 3);
+    }
+
+    /// `IntoIterator` for `&mut Fillet`.
+    #[test]
+    fn into_iter_mut_ref() {
+        let mut f: Fillet<i32> = [1, 2, 3].into();
+        for x in &mut f {
+            *x += 10;
+        }
+        assert_eq!(f, [11, 12, 13]);
+    }
+
+    /// `IntoIterator` for `&Fillet<()>` (ZST).
+    #[test]
+    fn into_iter_ref_zst() {
+        let f: Fillet<()> = [(); 3].into();
+        let mut count = 0;
+        for _ in &f {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    /// `Extend<&T>` where `T: Copy`.
+    #[test]
+    fn extend_ref_copy() {
+        let mut f: Fillet<i32> = [1, 2].into();
+        let more = [3, 4, 5];
+        f.extend(more.iter());
+        assert_eq!(f, [1, 2, 3, 4, 5]);
+    }
+
+    /// `Extend<&T>` from another `Fillet`.
+    #[test]
+    fn extend_ref_from_fillet() {
+        let mut f: Fillet<i32> = [1].into();
+        let other: Fillet<i32> = [2, 3].into();
+        f.extend(&other);
+        assert_eq!(f, [1, 2, 3]);
+    }
+
+    /// Cross-type [`PartialEq`] with slices and arrays.
+    #[test]
+    fn partial_eq_cross_type() {
+        let f: Fillet<i32> = [1, 2, 3].into();
+        assert_eq!(f, [1, 2, 3]);
+        assert_eq!(f, &[1, 2, 3]);
+        assert_eq!(f, [1, 2, 3].as_slice());
+        assert_eq!([1, 2, 3], f);
+        assert_eq!(&[1, 2, 3], f);
+
+        let arr = [1, 2, 3];
+        assert_eq!(f, &arr);
+        assert_eq!(&arr, f);
+
+        let e: Fillet<i32> = Fillet::EMPTY;
+        let empty: &[i32] = &[];
+        assert_eq!(e, [0i32; 0]);
+        assert_eq!(e, empty);
+    }
+
+    /// [`PartialOrd`] and [`Ord`].
+    #[test]
+    fn ordering() {
+        let a: Fillet<i32> = [1, 2].into();
+        let b: Fillet<i32> = [1, 3].into();
+        let c: Fillet<i32> = [1, 2].into();
+        assert!(a < b);
+        assert!(b > a);
+        assert_eq!(a.cmp(&c), core::cmp::Ordering::Equal);
+        assert_eq!(a.partial_cmp(&b), Some(core::cmp::Ordering::Less));
+
+        let empty: Fillet<i32> = Fillet::EMPTY;
+        assert!(empty < a);
+    }
+
+    /// `Send` and `Sync` for [`FilletIntoIter`].
+    #[test]
+    fn into_iter_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<FilletIntoIter<i32>>();
+        assert_sync::<FilletIntoIter<i32>>();
+    }
+
+    /// `Debug` for [`FilletIntoIter`].
+    #[test]
+    fn into_iter_debug() {
+        use alloc::format;
+        let f: Fillet<i32> = [1, 2, 3].into();
+        let mut iter = f.into_iter();
+        assert_eq!(format!("{iter:?}"), "[1, 2, 3]");
+        iter.next();
+        assert_eq!(format!("{iter:?}"), "[2, 3]");
+    }
+
+    /// [`as_slice`] on [`FilletIntoIter`].
+    ///
+    /// [`as_slice`]: FilletIntoIter::as_slice
+    #[test]
+    fn into_iter_as_slice() {
+        let f: Fillet<i32> = [1, 2, 3].into();
+        let mut iter = f.into_iter();
+        assert_eq!(iter.as_slice(), &[1, 2, 3]);
+        iter.next();
+        assert_eq!(iter.as_slice(), &[2, 3]);
+        iter.next_back();
+        assert_eq!(iter.as_slice(), &[2]);
+    }
+
+    /// [`as_mut_slice`] on [`FilletIntoIter`].
+    ///
+    /// [`as_mut_slice`]: FilletIntoIter::as_mut_slice
+    #[test]
+    fn into_iter_as_mut_slice() {
+        let f: Fillet<i32> = [1, 2, 3].into();
+        let mut iter = f.into_iter();
+        iter.as_mut_slice()[0] = 10;
+        assert_eq!(iter.next(), Some(10));
+    }
+
+    /// [`as_slice`] on [`FilletIntoIter`] with ZST.
+    ///
+    /// [`as_slice`]: FilletIntoIter::as_slice
+    #[test]
+    fn into_iter_as_slice_zst() {
+        let f: Fillet<()> = [(); 3].into();
+        let mut iter = f.into_iter();
+        assert_eq!(iter.as_slice().len(), 3);
+        iter.next();
+        assert_eq!(iter.as_slice().len(), 2);
+    }
+
+    /// [`as_slice`] on empty [`FilletIntoIter`].
+    ///
+    /// [`as_slice`]: FilletIntoIter::as_slice
+    #[test]
+    fn into_iter_as_slice_empty() {
+        let f: Fillet<i32> = Fillet::EMPTY;
+        let iter = f.into_iter();
+        assert_eq!(iter.as_slice(), &[]);
     }
 }
