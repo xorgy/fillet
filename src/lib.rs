@@ -373,26 +373,51 @@ impl<T> Fillet<T> {
             // SAFETY: Layout was computable when the `Fillet` was created.
             let old_layout = Self::compute_layout_unchecked(old_len);
 
+            // Write new_len BEFORE drop_in_place so that if a destructor panics,
+            // Fillet::drop during unwind sees only the surviving elements.
+            (old_ptr as *mut usize).write(new_len);
+
+            // Realloc (or dealloc) the allocation to match new_len.
+            // Runs after drop_in_place on both the normal and panic paths,
+            // so the allocation size matches the header when Fillet::drop runs.
+            struct ReallocGuard<T> {
+                fillet: *mut Fillet<T>,
+                old_layout: Layout,
+                new_len: usize,
+            }
+            impl<T> Drop for ReallocGuard<T> {
+                fn drop(&mut self) {
+                    unsafe {
+                        let fillet = &mut *self.fillet;
+                        if self.new_len != 0 {
+                            let new_layout = Fillet::<T>::compute_layout_unchecked(self.new_len);
+                            let old_ptr = fillet.ptr.unwrap_unchecked().as_ptr();
+                            fillet.ptr =
+                                NonNull::new(realloc(old_ptr, self.old_layout, new_layout.size()));
+                            if let Some(nn) = fillet.ptr {
+                                nn.cast::<usize>().write(self.new_len);
+                            } else {
+                                handle_alloc_error(new_layout);
+                            }
+                        } else {
+                            dealloc(fillet.ptr.unwrap_unchecked().as_ptr(), self.old_layout);
+                            fillet.ptr = None;
+                        }
+                    }
+                }
+            }
+
+            let _guard = ReallocGuard {
+                fillet: self as *mut _,
+                old_layout,
+                new_len,
+            };
+
             // SAFETY: Caller responsible for ensuring `new_len < self.len()`.
             ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                 old_ptr.byte_add(Self::DATA_OFFSET).cast::<T>().add(new_len),
                 old_len - new_len,
             ));
-
-            if new_len != 0 {
-                // SAFETY: If the old array layout was computable, then a shorter one is too.
-                let new_layout = Self::compute_layout_unchecked(new_len);
-
-                self.ptr = NonNull::new(realloc(old_ptr, old_layout, new_layout.size()));
-                if let Some(nn) = self.ptr {
-                    (nn.as_ptr() as *mut usize).write(new_len);
-                } else {
-                    handle_alloc_error(new_layout);
-                }
-            } else {
-                dealloc(old_ptr, old_layout);
-                self.ptr = None;
-            }
         }
     }
 
@@ -428,6 +453,37 @@ impl<T> Fillet<T> {
                 nn.cast::<usize>().write(new_len.get());
             } else {
                 handle_alloc_error(new_layout);
+            }
+        }
+    }
+}
+
+/// Shrinks a `Fillet`'s allocation to match `actual_len` on drop.
+///
+/// After `grow`/`grow_nonempty`, the header reflects the allocated capacity.
+/// `actual_len` tracks how many elements are initialized. On drop, the allocation
+/// is shrunk to `actual_len` if it differs from the header.
+struct ExtendGuard<T> {
+    fillet: *mut Fillet<T>,
+    actual_len: usize,
+}
+
+impl<T> Drop for ExtendGuard<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let fillet = &mut *self.fillet;
+            if size_of::<T>() == 0 {
+                fillet.len = self.actual_len;
+                return;
+            }
+            // If actual_len already matches the header, shrink_uninit_nonempty is a
+            // same-size realloc (no-op in practice), so skip it.
+            if fillet.len() != self.actual_len {
+                if let Some(nz) = NonZeroUsize::new(self.actual_len) {
+                    fillet.shrink_uninit_nonempty(nz);
+                } else {
+                    fillet.dealloc_nonempty();
+                }
             }
         }
     }
@@ -698,29 +754,88 @@ impl<T> Fillet<T> {
         if old_len == 0 {
             return;
         }
-        let s = self.as_mut_ptr();
-        let mut dst = 0;
-        for src in 0..old_len {
-            unsafe {
-                let r = f(&*s.add(src));
-                if r {
-                    if src != dst {
-                        s.add(dst).write(ptr::read(s.add(src)));
+
+        // [Kept, Kept, Hole, Hole, Unchecked, Unchecked]
+        // |            ^write      ^read               |
+        // |<-               old_len                  ->|
+        //
+        // On panic, the guard shifts Unchecked down to cover the Hole region
+        // and adjusts the allocation.
+        struct RetainGuard<T> {
+            fillet: *mut Fillet<T>,
+            data: *mut T,
+            read: usize,
+            write: usize,
+            old_len: usize,
+        }
+        impl<T> Drop for RetainGuard<T> {
+            #[cold]
+            fn drop(&mut self) {
+                let remaining = self.old_len - self.read;
+                unsafe {
+                    if remaining > 0 {
+                        ptr::copy(
+                            self.data.add(self.read),
+                            self.data.add(self.write),
+                            remaining,
+                        );
                     }
-                    dst += 1;
-                } else {
-                    drop(s.add(src).read());
+                    let new_len = self.write + remaining;
+                    let fillet = &mut *self.fillet;
+                    if let Some(nz) = NonZeroUsize::new(new_len) {
+                        fillet.shrink_uninit_nonempty(nz);
+                    } else {
+                        fillet.dealloc_nonempty();
+                    }
                 }
             }
         }
 
-        if dst == old_len {
-            return;
+        // Fast path: scan the prefix where every element is kept.
+        // No guard is needed until the first rejection.
+        let s = self.as_mut_ptr();
+        let mut read = 0;
+        loop {
+            if unsafe { !f(&*s.add(read)) } {
+                break;
+            }
+            read += 1;
+            if read == old_len {
+                return;
+            }
         }
 
+        // Advance read past the first rejected element before dropping it,
+        // so the guard never includes it in the Unchecked region.
+        let mut g = RetainGuard {
+            fillet: self as *mut _,
+            data: s,
+            read: read + 1,
+            write: read,
+            old_len,
+        };
+        unsafe { ptr::drop_in_place(s.add(read)) };
+
+        while g.read < old_len {
+            unsafe {
+                let cur = s.add(g.read);
+                if !f(&*cur) {
+                    g.read += 1;
+                    ptr::drop_in_place(cur);
+                } else {
+                    ptr::copy_nonoverlapping(cur, s.add(g.write), 1);
+                    g.write += 1;
+                    g.read += 1;
+                }
+            }
+        }
+
+        let write = g.write;
+        core::mem::forget(g);
+
         unsafe {
-            if let Some(len) = NonZeroUsize::new(dst) {
-                self.shrink_uninit_nonempty(len);
+            if let Some(nz) = NonZeroUsize::new(write) {
+                self.shrink_uninit_nonempty(nz);
             } else {
                 self.dealloc_nonempty();
             }
@@ -764,19 +879,21 @@ impl<T: Clone> Fillet<T> {
                 let new_len = old_len + range.len();
                 // SAFETY: Since by definition the range can't be longer than the `Fillet`,
                 //         if the range is not empty then the `Fillet` is also not empty.
-                let uninit = self.grow_nonempty(new_len);
-                // Need to consume uninit into a pointer so that it isn't mutably borrowed
-                // when we go to read the source range from the initialized portion.
-                let dst = uninit.as_mut_ptr();
+                let dst = self.grow_nonempty(new_len).as_mut_ptr();
+                let mut guard = ExtendGuard {
+                    fillet: self as *mut _,
+                    actual_len: old_len,
+                };
                 // SAFETY: The range is already bounds checked in the heap array.
-                let src = self
+                let src = (*guard.fillet)
                     .ptr
                     .unwrap_unchecked()
                     .byte_add(Self::DATA_OFFSET)
                     .cast::<T>();
-                for i in range {
-                    dst.add(i)
-                        .write(MaybeUninit::new(src.add(i).read().clone()));
+                for (j, i) in range.enumerate() {
+                    dst.add(j)
+                        .write(MaybeUninit::new(src.add(i).as_ref().clone()));
+                    guard.actual_len += 1;
                 }
             }
         }
@@ -800,9 +917,22 @@ impl<T> Extend<T> for Fillet<T> {
         // Exact size iterator.
         if upper_opt.is_some_and(|u| u == lower) {
             if lower != 0 {
-                let uninit = unsafe { self.grow(NonZeroUsize::new_unchecked(initial_len + lower)) };
-                for (i, item) in iter.enumerate() {
-                    uninit[i].write(item);
+                let uninit = unsafe { self.grow(NonZeroUsize::new_unchecked(initial_len + lower)) }
+                    .as_mut_ptr();
+                let mut guard = ExtendGuard {
+                    fillet: self as *mut _,
+                    actual_len: initial_len,
+                };
+                for item in iter {
+                    if guard.actual_len - initial_len >= lower {
+                        break;
+                    }
+                    unsafe {
+                        uninit
+                            .add(guard.actual_len - initial_len)
+                            .write(MaybeUninit::new(item))
+                    };
+                    guard.actual_len += 1;
                 }
             }
             return;
@@ -811,21 +941,24 @@ impl<T> Extend<T> for Fillet<T> {
         let mut capacity = initial_len;
         let mut growth = upper_opt.unwrap_or(lower.max(4));
         capacity += growth;
-        let mut remaining_uninit = unsafe { self.grow(NonZeroUsize::new_unchecked(capacity)) };
-        let mut len = initial_len;
+        let mut uninit = unsafe { self.grow(NonZeroUsize::new_unchecked(capacity)) }.as_mut_ptr();
+        let mut remaining_uninit = capacity - initial_len;
+        let mut guard = ExtendGuard {
+            fillet: self as *mut _,
+            actual_len: initial_len,
+        };
         for item in iter {
-            if remaining_uninit.is_empty() {
+            if remaining_uninit == 0 {
                 growth *= 2;
                 capacity += growth;
-                remaining_uninit = unsafe { self.grow_nonempty(capacity) };
+                let grown = unsafe { (*guard.fillet).grow_nonempty(capacity) };
+                remaining_uninit = grown.len();
+                uninit = grown.as_mut_ptr();
             }
-            remaining_uninit[0].write(item);
-            remaining_uninit = &mut remaining_uninit[1..];
-            len += 1;
-        }
-
-        if !remaining_uninit.is_empty() {
-            unsafe { self.shrink_uninit_nonempty(NonZeroUsize::new_unchecked(len)) };
+            unsafe { uninit.write(MaybeUninit::new(item)) };
+            unsafe { uninit = uninit.add(1) };
+            remaining_uninit -= 1;
+            guard.actual_len += 1;
         }
     }
 }
@@ -1049,11 +1182,23 @@ impl<T> Drop for FilletIntoIter<T> {
                 let len = ptr.cast::<usize>().read();
                 // SAFETY: Layout was computable when the `Fillet` was created.
                 let layout = Fillet::<T>::compute_layout_unchecked(len);
+
+                // Ensure dealloc runs even if drop_in_place panics.
+                struct DeallocGuard {
+                    ptr: *mut u8,
+                    layout: Layout,
+                }
+                impl Drop for DeallocGuard {
+                    fn drop(&mut self) {
+                        unsafe { dealloc(self.ptr, self.layout) };
+                    }
+                }
+
+                let _guard = DeallocGuard { ptr, layout };
                 ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                     data_ptr.add(self.start),
                     self.end - self.start,
                 ));
-                dealloc(ptr, layout);
             }
         }
     }
@@ -1243,7 +1388,7 @@ mod tests {
     /// Construct from an empty iterator.
     #[test]
     fn construction_from_iterator_empty() {
-        let f: Fillet<i32> = iter::empty().collect();
+        let f: Fillet<i32> = core::iter::empty().collect();
         assert_eq!(f.len(), 0);
         assert_eq!(*f, []);
     }
@@ -1363,6 +1508,16 @@ mod tests {
         let mut h2 = DefaultHasher::new();
         f2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    /// `Eq` and `Hash` behavior for ZSTs.
+    #[test]
+    fn eq_and_hash_zst() {
+        let f1: Fillet<()> = [(); 3].into();
+        let f2: Fillet<()> = [(); 3].into();
+        let f3: Fillet<()> = [(); 1].into();
+        assert_eq!(f1, f2);
+        assert_ne!(f1, f3);
     }
 
     /// `Debug` formatting.
@@ -1738,7 +1893,7 @@ mod tests {
     #[test]
     fn extend_empty() {
         let mut f: Fillet<i32> = [1].into();
-        f.extend(iter::empty::<i32>());
+        f.extend(core::iter::empty::<i32>());
         assert_eq!(*f, [1]);
     }
 
@@ -2040,30 +2195,6 @@ mod tests {
         f.retain(|_| false);
         assert_eq!(f.len(), 0);
         assert_eq!(DROPS.load(Ordering::SeqCst), 4);
-    }
-
-    /// [`retain`] should be able to panic in the predicate without triggering UB.
-    ///
-    /// [`retain`]: Fillet::retain
-    #[test]
-    #[cfg(miri)]
-    #[should_panic]
-    fn retain_panic_mid_loop() {
-        // Tests panic safety: predicate panics after processing some elements.
-        // If code is incorrect, during unwind, Fillet::drop will attempt drop_in_place on the full old_len,
-        // but [dst..old_len] contains uninitialized slots (after read/drop or read/write), leading to UB
-        // (Miri detects: drop of uninitialized memory).
-        // Use Dropper to force Drop glue on uninit slots.
-        let mut f: Fillet<()> = repeat_n((), 5).collect();
-        let mut count = 0;
-        f.retain(|_| {
-            count += 1;
-            if count == 3 {
-                panic!("Simulated panic in predicate");
-            }
-            count % 2 == 1 // Keep first, drop second, panic on third.
-        });
-        // If no panic, test fails; on panic, Miri should error if UB in drop.
     }
 
     /// [`as_ref`] behavior for non-empty [`Fillet`].
@@ -2516,5 +2647,450 @@ Requested Fillet larger than isize::MAX bytes.")]
         let f: Fillet<i32> = Fillet::EMPTY;
         let iter = f.into_iter();
         assert_eq!(iter.as_slice(), &[]);
+    }
+
+    /// [`pop`] should work with ZSTs, including correct drop counts.
+    ///
+    /// [`pop`]: Fillet::pop
+    #[test]
+    fn pop_zst() {
+        #[derive(Clone)]
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut f: Fillet<Dropper> = [Dropper, Dropper, Dropper].into();
+        assert_eq!(f.len(), 3);
+        let item = f.pop();
+        assert!(item.is_some());
+        assert_eq!(f.len(), 2);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        drop(item);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        assert!(f.pop().is_some());
+        assert!(f.pop().is_some());
+        assert!(f.pop().is_none());
+        assert_eq!(f.len(), 0);
+        drop(f);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+    }
+
+    /// [`truncate`] should work with ZSTs, triggering the correct number of drops.
+    ///
+    /// [`truncate`]: Fillet::truncate
+    #[test]
+    fn truncate_zst() {
+        struct Dropper;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut f: Fillet<Dropper> = repeat_n((), 5).map(|_| Dropper).collect();
+        f.truncate(2);
+        assert_eq!(f.len(), 2);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+        drop(f);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 5);
+    }
+
+    /// [`retain`] keeping all elements with a non-ZST exercises the fast-path prefix scan.
+    ///
+    /// [`retain`]: Fillet::retain
+    #[test]
+    fn retain_keep_all() {
+        let mut f: Fillet<i32> = [1, 2, 3, 4, 5].into();
+        f.retain(|_| true);
+        assert_eq!(f, [1, 2, 3, 4, 5]);
+    }
+
+    /// [`extend_from_within`] with a non-zero-start range and a `Clone + Drop` type.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_nonzero_drop_type() {
+        use alloc::string::String;
+        let mut f: Fillet<String> = ["a".into(), "b".into(), "c".into(), "d".into()].into();
+        f.extend_from_within(1..3);
+        assert_eq!(f.len(), 6);
+        assert_eq!(f[4], "b");
+        assert_eq!(f[5], "c");
+    }
+
+    /// [`extend_from_within`] with a range that exceeds the length is clamped.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_clamped() {
+        let mut f = Fillet::from([1, 2, 3]);
+        f.extend_from_within(1..100);
+        assert_eq!(f, [1, 2, 3, 2, 3]);
+
+        let mut g = Fillet::from([1, 2]);
+        g.extend_from_within(5..10); // entirely out of bounds
+        assert_eq!(g, [1, 2]);
+    }
+
+    /// [`extend_from_within`] on an empty `Fillet` is a no-op.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_empty() {
+        let mut f: Fillet<i32> = Fillet::EMPTY;
+        f.extend_from_within(..);
+        assert!(f.is_empty());
+    }
+
+    /// [`extend`] with an iterator whose `size_hint` overstates the count.
+    ///
+    /// `size_hint` has no safety contract, so the exact-size path must reconcile the
+    /// actual yield count and shrink the allocation if fewer items arrive.
+    ///
+    /// [`extend`]: Fillet::extend
+    #[test]
+    fn extend_inaccurate_size_hint() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[allow(dead_code)]
+        struct Dropper(u32); // Non-ZST to exercise the exact-size path.
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct ShortIter(usize);
+        impl Iterator for ShortIter {
+            type Item = Dropper;
+            fn next(&mut self) -> Option<Dropper> {
+                if self.0 == 0 {
+                    return None;
+                }
+                self.0 -= 1;
+                Some(Dropper(self.0 as u32))
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (10, Some(10))
+            }
+        }
+
+        let mut f: Fillet<Dropper> = Fillet::EMPTY;
+        f.extend(ShortIter(3));
+        assert_eq!(f.len(), 3);
+        drop(f);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+    }
+
+    /// [`extend_from_within`] with a range that does not start at zero.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_nonzero_start() {
+        let mut f = Fillet::from([10, 20, 30, 40]);
+        f.extend_from_within(2..4);
+        assert_eq!(f, [10, 20, 30, 40, 30, 40]);
+
+        let mut g = Fillet::from([1, 2, 3, 4, 5]);
+        g.extend_from_within(3..5);
+        assert_eq!(g, [1, 2, 3, 4, 5, 4, 5]);
+    }
+
+    /// [`extend_from_within`] with a `Clone + Drop` type.
+    ///
+    /// The source elements must not be invalidated during cloning.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_clone_drop() {
+        use alloc::string::String;
+        let mut f: Fillet<String> = ["hello".into(), "world".into()].into();
+        f.extend_from_within(..);
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[0], "hello");
+        assert_eq!(f[1], "world");
+        assert_eq!(f[2], "hello");
+        assert_eq!(f[3], "world");
+    }
+
+    /// [`retain`] with a panicking predicate must drop each element exactly once.
+    ///
+    /// [`retain`]: Fillet::retain
+    #[test]
+    fn retain_panic_drop_count() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[allow(dead_code)]
+        struct Dropper(u32); // Non-ZST to exercise the heap path.
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<Dropper> = (0..5).map(Dropper).collect();
+            let mut count = 0;
+            f.retain(|_| {
+                count += 1;
+                if count == 3 {
+                    panic!("predicate panic");
+                }
+                count % 2 == 1
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            5,
+            "each element must be dropped exactly once"
+        );
+    }
+
+    /// [`truncate`] must not double-drop if `T::drop()` panics.
+    ///
+    /// [`truncate`]: Fillet::truncate
+    #[test]
+    fn truncate_drop_panic() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct PanicDrop(u32);
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+                if self.0 == 3 {
+                    panic!("drop panic");
+                }
+            }
+        }
+
+        // f = [PanicDrop(0), PanicDrop(1), PanicDrop(2), PanicDrop(3), PanicDrop(4)]
+        // truncate(2) should drop [2, 3, 4]. PanicDrop(3) panics in drop.
+        // drop_in_place's internal guard still drops 4.
+        // On unwind, Fillet::drop must only drop the survivors [0, 1].
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<PanicDrop> = (0..5).map(PanicDrop).collect();
+            f.truncate(2);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            5,
+            "each element must be dropped exactly once"
+        );
+    }
+
+    /// [`truncate`] must not double-drop ZSTs if `T::drop()` panics.
+    ///
+    /// [`truncate`]: Fillet::truncate
+    #[test]
+    fn truncate_drop_panic_zst() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static PANIC_AT: AtomicUsize = AtomicUsize::new(3);
+        struct PanicDrop;
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                let n = DROPS.fetch_add(1, Ordering::SeqCst);
+                if n == PANIC_AT.load(Ordering::SeqCst) {
+                    panic!("drop panic");
+                }
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<PanicDrop> = repeat_n((), 5).map(|_| PanicDrop).collect();
+            f.truncate(2);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            5,
+            "each element must be dropped exactly once"
+        );
+    }
+
+    /// [`FilletIntoIter`] must free its allocation even if `T::drop()` panics.
+    #[test]
+    fn into_iter_drop_panic_no_leak() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct PanicDrop(u32);
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+                if self.0 == 1 {
+                    panic!("drop panic");
+                }
+            }
+        }
+
+        // Consume partially, then drop the iterator.
+        // PanicDrop(1) panics during iterator drop.
+        // All elements must still be dropped and the allocation freed.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let f: Fillet<PanicDrop> = (0..4).map(PanicDrop).collect();
+            let mut iter = f.into_iter();
+            let _ = iter.next(); // consumes PanicDrop(0)
+            drop(iter); // drops [1, 2, 3]; PanicDrop(1) panics
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            4,
+            "each element must be dropped exactly once"
+        );
+        // Allocation leak is detectable by Miri but not by drop counts.
+        // Run under Miri to verify no leak.
+    }
+
+    /// [`extend`] exact-size path must not drop uninitialized slots if `iter.next()` panics.
+    ///
+    /// [`extend`]: Fillet::extend
+    #[test]
+    fn extend_exact_size_next_panic() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[allow(dead_code)]
+        struct Dropper(u32);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct PanicIter(u32);
+        impl Iterator for PanicIter {
+            type Item = Dropper;
+            fn next(&mut self) -> Option<Dropper> {
+                let i = self.0;
+                self.0 += 1;
+                if i == 3 {
+                    panic!("next panic");
+                }
+                Some(Dropper(i))
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (6, Some(6))
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<Dropper> = Fillet::from_one(Dropper(100));
+            f.extend(PanicIter(0)); // writes 3 items then panics
+        }));
+
+        assert!(result.is_err());
+        // 1 pre-existing + 3 written by extend = 4 total must be dropped.
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            4,
+            "only initialized elements must be dropped"
+        );
+    }
+
+    /// [`extend`] amortized path must not drop uninitialized slots if `iter.next()` panics.
+    ///
+    /// [`extend`]: Fillet::extend
+    #[test]
+    fn extend_unknown_size_next_panic() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[allow(dead_code)]
+        struct Dropper(u32);
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct PanicIter(u32);
+        impl Iterator for PanicIter {
+            type Item = Dropper;
+            fn next(&mut self) -> Option<Dropper> {
+                let i = self.0;
+                self.0 += 1;
+                if i == 3 {
+                    panic!("next panic");
+                }
+                Some(Dropper(i))
+            }
+            // Unknown size — no upper bound.
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (0, None)
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<Dropper> = Fillet::from_one(Dropper(100));
+            f.extend(PanicIter(0));
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            4,
+            "only initialized elements must be dropped"
+        );
+    }
+
+    /// [`extend_from_within`] must not drop uninitialized slots if `T::clone()` panics.
+    ///
+    /// [`extend_from_within`]: Fillet::extend_from_within
+    #[test]
+    fn extend_from_within_clone_panic() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static CLONES: AtomicUsize = AtomicUsize::new(0);
+        #[allow(dead_code)]
+        struct PanicClone(u32);
+        impl Clone for PanicClone {
+            fn clone(&self) -> Self {
+                if CLONES.fetch_add(1, Ordering::SeqCst) == 2 {
+                    panic!("clone panic");
+                }
+                PanicClone(self.0)
+            }
+        }
+        impl Drop for PanicClone {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut f: Fillet<PanicClone> =
+                [PanicClone(0), PanicClone(1), PanicClone(2), PanicClone(3)].into();
+            f.extend_from_within(..); // panics on 3rd clone
+        }));
+
+        assert!(result.is_err());
+        // 4 originals + 2 successful clones = 6 drops.
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            6,
+            "only initialized elements must be dropped"
+        );
     }
 }
