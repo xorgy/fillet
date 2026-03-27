@@ -149,7 +149,7 @@ jobs:
       - name: cargo miri
         run: cargo miri test --locked --no-fail-fast
         env:
-          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-track-alloc-accesses -Zmiri-recursive-validation"
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows -Zmiri-track-alloc-accesses -Zmiri-recursive-validation"
 
   doc:
     name: cargo doc
